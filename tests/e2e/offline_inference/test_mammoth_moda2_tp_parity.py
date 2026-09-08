@@ -15,9 +15,9 @@ TP paths never exercise:
   ``VocabParallelEmbedding`` / ``ParallelLMHead`` (``gen_embed_tokens`` /
   ``gen_head``).  ``MammothModa2Qwen2ForCausalLM.compute_logits`` concatenates
   the two logit tensors: ``torch.cat([base_logits, gen_logits], dim=-1)``.
-  32800 is not a multiple of ``DEFAULT_VOCAB_PADDING_SIZE``, so the padded and
-  sharded width differs from the logical width -- if the padding is not sliced
-  off before the concat, the gen half lands at the wrong offset.
+  32800 is not a multiple of ``DEFAULT_VOCAB_PADDING_SIZE``. Both heads must
+  return their logical vocabulary widths before concatenation to preserve
+  the total logits width and the base/gen boundary.
 * **Per-request t2i token constraints** (``_apply_t2i_token_constraints``) that
   index that concatenated tensor by *absolute* token id (``eol_token_id``,
   ``visual_token_start_id``, ...).  A shifted offset silently constrains the
@@ -26,9 +26,7 @@ TP paths never exercise:
   stage through ``stage_input_processors.mammoth_moda2.ar2dit``.  The
   production code there asserts only the *length* of that tensor.
 
-Every one of those failure modes is silent: an image is still produced, it is
-just wrong.  So the checks are ordered strongest-first rather than
-end-to-end-first.
+These paths can fail silently, so check intermediate outputs as well as images.
 
 Check layers
 ------------
@@ -46,13 +44,13 @@ L2a    ``test_ar_stage_output_``   AR->DiT hidden states: length, token
        ``alignment``               alignment, dtype, no dead tensor.
 L2b    ``test_ar_stage_output_``   Hidden states vs the TP=1 reference.
        ``parity``
-L3     ``test_t2i_image_parity``   End-to-end pixel backstop.
+L3     ``test_t2i_image_parity``   Full-image numerical comparison.
 =====  ==========================  ============================================
 
 Scope
 -----
-Stage 0 (AR) only.  Stage 1 (DiT) is pinned to TP=1 on one device for every
-run, so any difference observed downstream is attributable to the AR stage.
+Stage 0 (AR) only. Stage 1 (DiT) is pinned to TP=1, device 0 and a fixed seed.
+Downstream differences still require investigation; they do not prove an AR bug.
 DiT-side parallelism, AR pipeline/data parallelism and ROCm are out of scope
 per #7114.
 
@@ -74,6 +72,10 @@ Config-only layer, no accelerator needed::
 Each TP degree starts and tears down exactly one engine; the capture is cached
 for the module so all layers share a single run per degree.  Engines are never
 held concurrently.
+
+The default workload is a 256x256, two-step smoke test, not the 1024x1024
+performance baseline in #7114. Token equality is exact; hidden-state and image
+checks use the reported tolerances and do not establish bitwise equality.
 """
 
 from __future__ import annotations
@@ -81,9 +83,10 @@ from __future__ import annotations
 import gc
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -127,34 +130,16 @@ _VIDEO_TOKEN_ID = 151656  # "<|video_pad|>"
 _VISION_START_TOKEN_ID = 151652  # "<|vision_start|>"
 _VISION_END_TOKEN_ID = 151653  # "<|vision_end|>"
 
-# Hidden states cross the stage boundary as float32 but are computed in bf16.
-# TP changes the summation order inside every RowParallelLinear all-reduce, so
-# bit-exactness is not a meaningful requirement -- bf16 carries ~8 mantissa
-# bits (eps ~ 7.8e-3) and the error compounds across layers.  These bounds are
-# deliberately loose; the assertion that carries the signal is the cosine
-# similarity, and the measured numbers are always printed so PR-3 can report
-# them per TP degree.  Override while investigating a specific divergence.
+# These are provisional numerical tolerances, not evidence of TP parity.
+# Report measured errors alongside them; token equality is checked separately.
+# Hidden states cross the stage boundary as float32. Their computation dtype
+# and the summation order can affect the observed errors.
 HIDDEN_ATOL = float(os.environ.get("MAMMOTH_TP_HIDDEN_ATOL", "2e-2"))
 HIDDEN_RTOL = float(os.environ.get("MAMMOTH_TP_HIDDEN_RTOL", "2e-2"))
 HIDDEN_MIN_COSINE = float(os.environ.get("MAMMOTH_TP_HIDDEN_MIN_COSINE", "0.9995"))
-# Images are uint8-quantized downstream; 1/255 ~ 3.9e-3.
+# Compare the complete, unmodified VAE output in its native value range.
+# Passing this tolerance check does not establish bitwise image equality.
 PIXEL_ATOL = float(os.environ.get("MAMMOTH_TP_PIXEL_ATOL", "4e-3"))
-
-# Fixed sampling coordinates: (channel, row_fraction, col_fraction).
-_PIXEL_SAMPLE_COORDS = [
-    (0, 0.0, 0.0),
-    (0, 0.5, 0.5),
-    (0, 1.0, 1.0),
-    (0, 0.25, 0.75),
-    (1, 0.0, 1.0),
-    (1, 0.5, 0.0),
-    (1, 0.75, 0.25),
-    (1, 1.0, 0.5),
-    (2, 0.0, 0.5),
-    (2, 0.5, 1.0),
-    (2, 0.75, 0.75),
-    (2, 1.0, 0.0),
-]
 
 pytestmark = [
     pytest.mark.slow,
@@ -167,15 +152,18 @@ pytestmark = [
 def _tp_param(tp_size: int) -> Any:
     """One pytest param per TP degree, carrying its own ``cards_{n}`` mark.
 
-    ``hardware_marks`` attaches the SKU, the platform mark and a skipif for
-    ``device_count() < num_cards``, so a 2-card box collects the whole sweep
-    and skips tp4/tp8 instead of erroring.  A100 is not a registered SKU in
-    ``pyproject.toml``; H100 is the closest registered CUDA resource and
-    matches the existing MammothModa2 e2e test.
+    H100 selects the existing CI resource; local CUDA runs can also use A100.
+    Hardware marks skip degrees needing more visible GPUs. Explicitly skip
+    non-CUDA platforms, including TP=1.
     """
+    from vllm.platforms import current_platform
+
     return pytest.param(
         tp_size,
-        marks=hardware_marks(res={"cuda": "H100"}, num_cards=tp_size),
+        marks=[
+            *hardware_marks(res={"cuda": "H100"}, num_cards=tp_size),
+            pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA GPUs"),
+        ],
         id=f"tp{tp_size}",
     )
 
@@ -203,8 +191,8 @@ class ARCapture:
     answer_start_index: int
     #: (num_tokens, hidden_size) float32 on CPU -- the AR -> DiT stage output.
     hidden_states: torch.Tensor
-    #: Sampled pixels of the final image, or ``None`` when the DiT produced none.
-    image_pixels: tuple[float, ...] | None
+    #: Complete VAE output, (3, height, width), float32 on CPU.
+    image: torch.Tensor
 
 
 @contextmanager
@@ -233,7 +221,7 @@ def _record_stage_output(sink: list[dict[str, Any]]) -> Iterator[None]:
                 {
                     "full_token_ids": list(info["full_token_ids"]),
                     "answer_start_index": int(info["answer_start_index"][0]),
-                    "hidden_states": hidden.detach().to(device="cpu", dtype=torch.float32).clone(),
+                    "hidden_states": hidden.detach().to(device="cpu").clone(),
                 }
             )
         return result
@@ -248,10 +236,10 @@ def _record_stage_output(sink: list[dict[str, Any]]) -> Iterator[None]:
 def _tp_deploy_config(tp_size: int) -> str:
     """Materialize a deploy yaml with stage 0 at ``tp_size``.
 
-    Stage 1 (DiT) is left on device 0 at TP=1: DiT-side parallelism is out of
-    scope, and holding it constant keeps every downstream difference
-    attributable to the AR stage.  Stage 0's ``gpu_memory_utilization`` of 0.5
-    and stage 1's 0.3 still share device 0, exactly as the shipped config does.
+    Stage 1 (DiT) is left on device 0 at TP=1. Both workers are seeded via
+    their engine configs; OmniRunner's seed argument alone is not forwarded
+    to Omni. Stage 0's memory utilization of 0.5 and stage 1's 0.3 share
+    device 0, as in the shipped config. This layout needs GPU validation.
     """
     return modify_stage_config(
         BASE_DEPLOY_CONFIG,
@@ -260,10 +248,20 @@ def _tp_deploy_config(tp_size: int) -> str:
                 0: {
                     "tensor_parallel_size": tp_size,
                     "devices": ",".join(str(i) for i in range(tp_size)),
+                    "seed": SEED,
+                    "max_num_seqs": 1,
+                    "enforce_eager": True,
+                    "enable_prefix_caching": False,
+                    "enable_chunked_prefill": False,
                 },
                 1: {
                     "tensor_parallel_size": 1,
                     "devices": "0",
+                    # DiT uses randn_tensor without a request generator, so
+                    # seed its worker as well as the AR sampler.
+                    "seed": SEED,
+                    "max_num_seqs": 1,
+                    "enforce_eager": True,
                 },
             }
         },
@@ -311,30 +309,28 @@ def _build_prompt(ar_width: int, ar_height: int, gen_cfg: dict[str, Any]) -> dic
     return prompt
 
 
-def _sample_pixels(img_tensor: torch.Tensor) -> tuple[float, ...]:
-    """Sample fixed fractional coordinates from a (C, H, W) or (1, C, H, W) tensor."""
-    t = img_tensor.float().clamp(0.0, 1.0)
-    if t.ndim == 4:
-        t = t[0]
-    _, height, width = t.shape
-    return tuple(
-        round(float(t[c, min(int(rh * (height - 1)), height - 1), min(int(rw * (width - 1)), width - 1)]), 6)
-        for c, rh, rw in _PIXEL_SAMPLE_COORDS
-    )
-
-
-def _extract_image_pixels(outputs: list[Any]) -> tuple[float, ...] | None:
+def _extract_image(outputs: list[Any]) -> torch.Tensor:
+    """Require one complete image, without clipping away numerical errors."""
+    images: list[torch.Tensor] = []
     for out in outputs:
         for request_output in out if isinstance(out, list) else [out]:
-            for completion in getattr(request_output, "outputs", None) or []:
-                mm = getattr(completion, "multimodal_output", None)
-                if not (isinstance(mm, dict) and "image" in mm):
-                    continue
-                images = mm["image"] if isinstance(mm["image"], list) else [mm["image"]]
-                for img in images:
-                    if isinstance(img, torch.Tensor) and img.ndim in (3, 4):
-                        return _sample_pixels(img)
-    return None
+            assert not getattr(request_output, "error", None), request_output.error
+            mm = request_output.multimodal_output
+            if not isinstance(mm, Mapping) or "image" not in mm:
+                continue
+            payload = mm["image"]
+            for img in payload if isinstance(payload, list) else [payload]:
+                assert isinstance(img, torch.Tensor), f"Expected image tensor, got {type(img)}"
+                if img.ndim == 4:
+                    assert img.shape[0] == 1, f"Expected a single image, got {tuple(img.shape)}"
+                    img = img[0]
+                assert img.shape == (3, IMAGE_HEIGHT, IMAGE_WIDTH), (
+                    f"Expected image shape {(3, IMAGE_HEIGHT, IMAGE_WIDTH)}, got {tuple(img.shape)}"
+                )
+                assert torch.isfinite(img).all(), "Image contains NaN or Inf"
+                images.append(img.detach().to(device="cpu", dtype=torch.float32).clone())
+    assert len(images) == 1, f"Expected exactly one image tensor, got {len(images)}"
+    return images[0]
 
 
 def _run_capture(tp_size: int) -> ARCapture:
@@ -344,15 +340,24 @@ def _run_capture(tp_size: int) -> ARCapture:
     grid_tokens = ar_height * (ar_width + 1)
 
     prompt = _build_prompt(ar_width, ar_height, _load_t2i_gen_config())
-    ar_sampling = SamplingParams(temperature=0.0, top_k=1, max_tokens=grid_tokens + 1, detokenize=False)
-    dit_sampling = SamplingParams(temperature=0.0, max_tokens=1, detokenize=False)
+    ar_sampling = SamplingParams(temperature=0.0, top_k=1, seed=SEED, max_tokens=grid_tokens + 1, detokenize=False)
+    dit_sampling = SamplingParams(
+        temperature=0.0,
+        seed=SEED,
+        max_tokens=1,
+        detokenize=False,
+        extra_args={
+            "num_inference_steps": DIT_INFERENCE_STEPS,
+            "text_guidance_scale": DIT_GUIDANCE_SCALE,
+            "cfg_range": DIT_CFG_RANGE,
+        },
+    )
 
     sink: list[dict[str, Any]] = []
     try:
         with _record_stage_output(sink):
             with OmniRunner(
-                get_model_prefix() + MODEL_PATH,
-                seed=SEED,
+                str(_model_dir()),
                 deploy_config=_tp_deploy_config(tp_size),
             ) as runner:
                 outputs = list(runner.omni.generate([prompt], [ar_sampling, dit_sampling]))
@@ -376,46 +381,51 @@ def _run_capture(tp_size: int) -> ARCapture:
         full_token_ids=full_token_ids,
         answer_start_index=answer_start,
         hidden_states=recorded["hidden_states"],
-        image_pixels=_extract_image_pixels(outputs),
+        image=_extract_image(outputs),
     )
 
 
 # One engine per TP degree for the whole module.  Failures are cached too, so a
 # degree that cannot start does not get retried once per check layer.
-_CAPTURES: dict[int, ARCapture | BaseException] = {}
+_CAPTURES: dict[int, ARCapture | Exception] = {}
 
 
 def capture(tp_size: int) -> ARCapture:
     if tp_size not in _CAPTURES:
         try:
             _CAPTURES[tp_size] = _run_capture(tp_size)
-        except BaseException as exc:  # noqa: BLE001 - re-raised immediately
+        except Exception as exc:
             _CAPTURES[tp_size] = exc
             raise
     cached = _CAPTURES[tp_size]
-    if isinstance(cached, BaseException):
+    if isinstance(cached, Exception):
         pytest.fail(f"TP={tp_size} capture failed earlier in this module: {cached!r}")
     return cached
 
 
+@cache
 def _model_dir() -> Path:
     """Resolve the checkpoint directory.
 
     ``MODEL_PREFIX`` points at a local mirror in some CI environments, in which
     case there is nothing to download; fall back to the hub otherwise.
     """
+    # Resolve once and pass this same snapshot path to every engine. Otherwise
+    # the generation config and separate TP runs could resolve different revisions.
     prefix = get_model_prefix()
     if prefix:
         local = Path(prefix + MODEL_PATH)
-        if local.exists():
-            return local
-    return Path(snapshot_download(MODEL_PATH))
+        assert local.is_dir(), f"MODEL_PREFIX checkpoint directory does not exist: {local}"
+        model_dir = local
+    else:
+        model_dir = Path(snapshot_download(MODEL_PATH))
+    print(f"\nTP parity checkpoint: {model_dir}")
+    return model_dir
 
 
 def _load_t2i_gen_config() -> dict[str, Any]:
     cfg_path = _model_dir() / "t2i_generation_config.json"
-    if not cfg_path.exists():
-        pytest.skip(f"t2i_generation_config.json not found at {cfg_path}")
+    assert cfg_path.is_file(), f"t2i_generation_config.json not found at {cfg_path}"
     with cfg_path.open() as f:
         return json.load(f)
 
@@ -436,16 +446,13 @@ def test_gen_vocab_padding_and_sharding(tp_size: int) -> None:
     first, i.e. if the concatenation offset equals ``base_vocab_size`` at every
     TP degree.
 
-    This runs without an accelerator, so it gives CI signal on the hypothesis
-    before any of the multi-GPU layers below can run.
+    This checks configuration arithmetic only; it does not exercise weight
+    loading, logits gathering or collectives.
     """
-    try:
-        from vllm.model_executor.layers.vocab_parallel_embedding import (
-            DEFAULT_VOCAB_PADDING_SIZE,
-            pad_vocab_size,
-        )
-    except ImportError as exc:  # pragma: no cover - vLLM layout change
-        pytest.skip(f"vLLM vocab-parallel helpers unavailable: {exc}")
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        DEFAULT_VOCAB_PADDING_SIZE,
+        pad_vocab_size,
+    )
 
     # The Preview AR text config, constructed from its own defaults: the
     # top-level Mammothmoda2Config leaves ``llm_config`` unset when built with
@@ -465,23 +472,12 @@ def test_gen_vocab_padding_and_sharding(tp_size: int) -> None:
     padded_gen = pad_vocab_size(gen_vocab_size, DEFAULT_VOCAB_PADDING_SIZE)
     padded_base = pad_vocab_size(base_vocab_size, DEFAULT_VOCAB_PADDING_SIZE)
 
-    # The premise of this whole test file.  If a future config makes 32800 an
-    # exact multiple, the padding-offset hypothesis stops applying and the
-    # comment above should be revisited rather than the assertion relaxed.
-    assert padded_gen != gen_vocab_size, (
-        f"gen_vocab_size={gen_vocab_size} now pads to itself ({padded_gen}); the padding-offset failure "
-        "mode this file was written for no longer applies -- re-derive the risk before deleting coverage."
-    )
-
     for name, padded in (("base", padded_base), ("gen", padded_gen)):
         assert padded % tp_size == 0, (
             f"TP={tp_size}: padded {name} vocab {padded} is not divisible by the TP degree, so the "
             "per-rank shard widths are unequal and the gathered logits cannot be sliced uniformly"
         )
 
-    # What compute_logits relies on: each half is sliced back to its logical
-    # width before torch.cat, so the gen half starts exactly at base_vocab_size.
-    assert base_vocab_size + gen_vocab_size == total_vocab_size
     assert padded_base >= base_vocab_size and padded_gen >= gen_vocab_size
 
     print(
@@ -542,9 +538,8 @@ def test_ar_grid_structure(tp_size: int) -> None:
             break
 
     assert not violations, (
-        f"TP={tp_size}: the t2i token constraints did not hold. This is the signature of a shifted "
-        "base/gen logits concatenation offset -- check compute_logits and the padding of gen_head.\n  "
-        + "\n  ".join(violations)
+        f"TP={tp_size}: the t2i token constraints did not hold. "
+        "Inspect request metadata, token constraints and the base/gen logits layout.\n  " + "\n  ".join(violations)
     )
 
 
@@ -555,12 +550,8 @@ def test_ar_grid_structure(tp_size: int) -> None:
 def test_ar_token_parity(tp_size: int) -> None:
     """Greedy decoding must select the same tokens at every TP degree.
 
-    #7114 commits to identical output at a fixed seed.  TP reorders the
-    all-reduce summations, so logits differ in the last bits; with
-    ``temperature=0, top_k=1`` that only changes the selected token where two
-    candidates are near-tied.  If this fails, the failure message says whether
-    the divergence looks like a near-tie (a numerics finding to report) or a
-    structural jump (a layout bug to fix).
+    Report the first divergence. Token IDs are categorical; their numerical
+    distance cannot distinguish a logits near-tie from a layout or routing bug.
     """
     reference = capture(REFERENCE_TP)
     cap = capture(tp_size)
@@ -586,9 +577,8 @@ def test_ar_token_parity(tp_size: int) -> None:
         f"TP={tp_size}: token divergence from the TP={REFERENCE_TP} reference at index {first_divergence} "
         f"(row {row}, column {column} of {ar_width}): got {got}, expected {want}. "
         f"{matching}/{len(reference.generated_token_ids)} tokens matched overall.\n"
-        f"  |got - expected| = {abs(got - want)}. A small delta between two neighbouring visual tokens "
-        "points at a near-tie under reordered all-reduce (report it in the TP findings); a large jump, "
-        "or a token outside the visual range, points at a logits-layout bug."
+        "Compare logits at the first divergent step with identical input tokens to investigate "
+        "numerical, routing or layout differences. Token ID distance does not identify the cause."
     )
 
 
@@ -597,22 +587,26 @@ def test_ar_token_parity(tp_size: int) -> None:
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("tp_size", TP_PARAMS)
 def test_ar_stage_output_alignment(tp_size: int) -> None:
-    """The AR->DiT hidden states must be complete and token-aligned.
+    """Check stage-output shape, dtype, boundaries and finite, nonzero rows.
 
-    ``ar2dit`` asserts only ``hidden_total == len(prompt) + len(generated)``.
-    That length can be right while the contents are not: under TP the hidden
-    states are replicated by the row-parallel all-reduce, and only the driver
-    rank's copy reaches the orchestrator.  These checks cover what the length
-    assertion cannot.
+    These structural checks do not establish that each row belongs to the
+    correct token. The parity check also compares the token sequence and values.
     """
+    from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
+
     cap = capture(tp_size)
     hidden = cap.hidden_states
+    text_config = Mammothmoda2Config.from_pretrained(str(_model_dir())).get_text_config()
 
     assert hidden.ndim == 2, f"TP={tp_size}: expected (num_tokens, hidden_size), got shape {tuple(hidden.shape)}"
     assert hidden.shape[0] == len(cap.full_token_ids), (
         f"TP={tp_size}: {hidden.shape[0]} hidden states for {len(cap.full_token_ids)} tokens -- "
         "the stage output is not token-aligned"
     )
+    assert hidden.shape[1] == text_config.hidden_size, (
+        f"TP={tp_size}: expected full hidden size {text_config.hidden_size}, got {hidden.shape[1]}"
+    )
+    assert hidden.dtype == torch.float32, f"TP={tp_size}: expected float32 stage output, got {hidden.dtype}"
     assert cap.answer_start_index > 0, (
         f"TP={tp_size}: answer_start_index={cap.answer_start_index} leaves no prompt span"
     )
@@ -622,9 +616,7 @@ def test_ar_stage_output_alignment(tp_size: int) -> None:
     )
     assert torch.isfinite(hidden).all(), f"TP={tp_size}: stage output contains NaN or Inf"
 
-    # A rank that contributed nothing shows up as an all-zero span; check the
-    # prompt and generated halves separately so a partially gathered tensor
-    # cannot hide behind a healthy prompt prefix.
+    # Check both spans for empty or all-zero rows without assigning a cause.
     prompt_span = hidden[: cap.answer_start_index]
     generated_span = hidden[cap.answer_start_index :]
     for name, span in (("prompt", prompt_span), ("generated", generated_span)):
@@ -632,7 +624,7 @@ def test_ar_stage_output_alignment(tp_size: int) -> None:
         dead_rows = int((span.abs().sum(dim=-1) == 0).sum())
         assert dead_rows == 0, (
             f"TP={tp_size}: {dead_rows}/{span.shape[0]} rows of the {name} span are all-zero -- "
-            "the stage output looks partially gathered"
+            "inspect the corresponding token positions in the AR output"
         )
 
     print(
@@ -648,14 +640,17 @@ def test_ar_stage_output_alignment(tp_size: int) -> None:
 def test_ar_stage_output_parity(tp_size: int) -> None:
     """AR->DiT hidden states must agree with the TP=1 reference.
 
-    These are what conditions the DiT, so a drift here changes the image even
-    when every token id matched.  Tolerances are loose on purpose (see
-    ``HIDDEN_ATOL``); the measured numbers are printed either way so PR-3 can
-    report per-degree drift instead of only pass/fail.
+    Compare numerical errors only when every input token and boundary matches.
+    Print measured errors and thresholds without inferring the cause of drift.
     """
     reference = capture(REFERENCE_TP)
     cap = capture(tp_size)
 
+    assert cap.full_token_ids == reference.full_token_ids, (
+        f"TP={tp_size}: full token sequence differs from TP={REFERENCE_TP}; "
+        "hidden states cannot be compared as numerical TP parity on different inputs. "
+        "Inspect token parity first."
+    )
     assert cap.hidden_states.shape == reference.hidden_states.shape, (
         f"TP={tp_size}: stage output shape {tuple(cap.hidden_states.shape)} != "
         f"TP={REFERENCE_TP} shape {tuple(reference.hidden_states.shape)}"
@@ -666,6 +661,7 @@ def test_ar_stage_output_parity(tp_size: int) -> None:
     )
 
     got, want = cap.hidden_states, reference.hidden_states
+    assert torch.isfinite(got).all() and torch.isfinite(want).all(), "Hidden states contain NaN or Inf"
     abs_diff = (got - want).abs()
     max_abs = float(abs_diff.max())
     max_rel = float((abs_diff / want.abs().clamp_min(1e-6)).max())
@@ -673,19 +669,18 @@ def test_ar_stage_output_parity(tp_size: int) -> None:
     worst_token = int(abs_diff.max(dim=-1).values.argmax())
     print(
         f"\n[tp{tp_size}] stage-output drift vs tp{REFERENCE_TP}: "
-        f"max_abs={max_abs:.6e} max_rel={max_rel:.6e} cosine={cosine:.8f} worst_token={worst_token}"
+        f"max_abs={max_abs:.6e} max_rel={max_rel:.6e} cosine={cosine:.8f} worst_token={worst_token} "
+        f"atol={HIDDEN_ATOL} rtol={HIDDEN_RTOL} min_cosine={HIDDEN_MIN_COSINE}"
     )
 
     assert cosine >= HIDDEN_MIN_COSINE, (
         f"TP={tp_size}: stage output cosine similarity {cosine:.8f} < {HIDDEN_MIN_COSINE}. "
-        "This is well beyond reordered-all-reduce noise -- the AR stage is producing different "
-        f"conditioning, not just a differently rounded one. Worst token index: {worst_token}."
+        f"Worst token index: {worst_token}. Investigate before changing the threshold."
     )
     assert torch.allclose(got, want, atol=HIDDEN_ATOL, rtol=HIDDEN_RTOL), (
-        f"TP={tp_size}: stage output exceeds tolerance (max_abs={max_abs:.6e} > atol={HIDDEN_ATOL}, "
-        f"max_rel={max_rel:.6e} > rtol={HIDDEN_RTOL}) at token {worst_token}, "
-        f"though cosine similarity ({cosine:.8f}) stayed above {HIDDEN_MIN_COSINE}. "
-        "Localized drift like this usually means one token's routing differed -- check gen_token_mask."
+        f"TP={tp_size}: stage output fails |got - reference| <= atol + rtol * |reference| "
+        f"with atol={HIDDEN_ATOL}, rtol={HIDDEN_RTOL}. max_abs={max_abs:.6e}, "
+        f"max_rel={max_rel:.6e}, worst_token={worst_token}, cosine={cosine:.8f}."
     )
 
 
@@ -694,27 +689,22 @@ def test_ar_stage_output_parity(tp_size: int) -> None:
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("tp_size", COMPARISON_TP_PARAMS)
 def test_t2i_image_parity(tp_size: int) -> None:
-    """End-to-end backstop: same prompt and seed, same image.
-
-    The DiT runs at TP=1 for every degree, so if the layers above are green
-    this one is redundant by construction -- which is the point.  It failing
-    while L1/L2 pass means something outside the AR stage output differs, and
-    it passing on its own proves nothing about layout: an image is produced
-    either way.  Never treat this as the primary signal.
-    """
+    """Compare all raw image values and report exact equality separately."""
     reference = capture(REFERENCE_TP)
     cap = capture(tp_size)
 
-    if reference.image_pixels is None:
-        pytest.skip(f"TP={REFERENCE_TP} produced no image tensor; nothing to compare against")
-    assert cap.image_pixels is not None, f"TP={tp_size}: pipeline produced no image tensor"
-
-    mismatches = [
-        f"pixel {i}: got {got:.6f}, expected {want:.6f} (delta {abs(got - want):.2e})"
-        for i, (got, want) in enumerate(zip(cap.image_pixels, reference.image_pixels))
-        if abs(got - want) > PIXEL_ATOL
-    ]
-    assert not mismatches, (
-        f"TP={tp_size}: {len(mismatches)}/{len(reference.image_pixels)} sampled pixels differ from the "
-        f"TP={REFERENCE_TP} reference by more than {PIXEL_ATOL}.\n  " + "\n  ".join(mismatches)
+    assert cap.full_token_ids == reference.full_token_ids, (
+        f"TP={tp_size}: token sequences differ; inspect token parity before comparing images"
+    )
+    assert cap.image.shape == reference.image.shape, "Image shapes differ"
+    difference = (cap.image - reference.image).abs()
+    max_abs = float(difference.max())
+    mean_abs = float(difference.mean())
+    print(
+        f"\n[tp{tp_size}] image drift vs tp{REFERENCE_TP}: "
+        f"max_abs={max_abs:.6e} mean_abs={mean_abs:.6e} atol={PIXEL_ATOL} "
+        f"exact_equal={torch.equal(cap.image, reference.image)}"
+    )
+    assert torch.allclose(cap.image, reference.image, atol=PIXEL_ATOL, rtol=0), (
+        f"TP={tp_size}: full image exceeds atol={PIXEL_ATOL}: max_abs={max_abs:.6e}, mean_abs={mean_abs:.6e}"
     )
